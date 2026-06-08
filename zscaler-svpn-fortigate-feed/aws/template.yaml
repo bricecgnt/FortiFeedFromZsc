@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Zscaler SVPN -> FortiGate IP feed. Fetches the published Zscaler SVPN
+  (Z-Tunnel 2.0) IP list on a schedule and publishes IPv4/IPv6 text files to S3
+  for a FortiGate External Threat Feed to consume. Self-contained: the function
+  code is embedded in this template, so the deployed stack has no dependency on
+  any external repository. Community solution, provided as-is, no warranty, not
+  an official Zscaler product.
+
+Parameters:
+  ZscalerCloud:
+    Type: String
+    Default: zscaler.net
+    AllowedValues:
+      - zscaler.net
+      - zscalertwo.net
+      - zscalerthree.net
+      - zscalerten.net
+      - zscalereleven.net
+      - zscalertwelve.net
+      - zscalerbeta.net
+      - zspreview.net
+      - zscloud.net
+      - zscalergov.us
+    Description: Your Zscaler cloud name.
+  ScheduleExpression:
+    Type: String
+    Default: rate(6 hours)
+    Description: How often to refresh the feed (EventBridge schedule expression).
+  ExposureMode:
+    Type: String
+    Default: PublicRead
+    AllowedValues:
+      - PublicRead
+      - CloudFront
+    Description: >-
+      PublicRead = serve the two files directly from S3 over HTTPS (simplest).
+      CloudFront = keep the bucket fully private and serve via CloudFront+OAC.
+  MinExpected:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Refuse to publish if fewer than this many valid IPs are found.
+
+Conditions:
+  UsePublicRead: !Equals [!Ref ExposureMode, PublicRead]
+  UseCloudFront: !Equals [!Ref ExposureMode, CloudFront]
+
+Resources:
+
+  FeedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration: !If
+        - UseCloudFront
+        - BlockPublicAcls: true
+          IgnorePublicAcls: true
+          BlockPublicPolicy: true
+          RestrictPublicBuckets: true
+        - BlockPublicAcls: true
+          IgnorePublicAcls: true
+          BlockPublicPolicy: false
+          RestrictPublicBuckets: false
+
+  PublicReadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UsePublicRead
+    Properties:
+      Bucket: !Ref FeedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AnonymousReadFeedObjects
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${FeedBucket.Arn}/zscaler/*'
+
+  CloudFrontBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseCloudFront
+    Properties:
+      Bucket: !Ref FeedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadViaOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FeedBucket.Arn}/zscaler/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: WriteFeedObjects
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${FeedBucket.Arn}/zscaler/*'
+
+  FeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ZSCALER_CLOUD: !Ref ZscalerCloud
+          S3_BUCKET: !Ref FeedBucket
+          S3_KEY_IPV4: zscaler/svpn_ipv4.txt
+          S3_KEY_IPV6: zscaler/svpn_ipv6.txt
+          MIN_EXPECTED: !Sub '${MinExpected}'
+          HTTP_TIMEOUT: '20'
+      Code:
+        ZipFile: |
+          import ipaddress, json, os, ssl, urllib.request
+          from datetime import datetime, timezone
+          import boto3
+
+          HOST = "config.zscaler.com"
+          CLOUDS = {"zscaler.net", "zscalertwo.net", "zscalerthree.net", "zscalerten.net",
+                    "zscalereleven.net", "zscalertwelve.net", "zscalerbeta.net",
+                    "zspreview.net", "zscloud.net", "zscalergov.us"}
+          s3 = boto3.client("s3")
+
+
+          def _find(node, out):
+              if isinstance(node, dict):
+                  for k, v in node.items():
+                      if k == "svpnIPs" and isinstance(v, list):
+                          out += [x for x in v if isinstance(x, str)]
+                      else:
+                          _find(v, out)
+              elif isinstance(node, list):
+                  for i in node:
+                      _find(i, out)
+              return out
+
+
+          def _split(ips):
+              v4, v6 = set(), set()
+              for e in ips:
+                  e = e.strip()
+                  if not e:
+                      continue
+                  try:
+                      o = ipaddress.ip_address(e)
+                  except ValueError:
+                      continue
+                  (v4 if o.version == 4 else v6).add(o)
+              return [str(i) for i in sorted(v4)], [str(i) for i in sorted(v6)]
+
+
+          def _body(ips, cloud, fam):
+              ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              return ("# Zscaler SVPN %s cloud=%s generated=%s count=%d\n" % (fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
+
+
+          def handler(event, context):
+              cloud = os.environ.get("ZSCALER_CLOUD", "zscaler.net").strip().lower()
+              if cloud not in CLOUDS:
+                  raise ValueError("Unrecognised Zscaler cloud: %s" % cloud)
+              bucket = os.environ["S3_BUCKET"]
+              k4 = os.environ.get("S3_KEY_IPV4", "zscaler/svpn_ipv4.txt")
+              k6 = os.environ.get("S3_KEY_IPV6", "zscaler/svpn_ipv6.txt")
+              mn = int(os.environ.get("MIN_EXPECTED", "10"))
+              to = int(os.environ.get("HTTP_TIMEOUT", "20"))
+              url = "https://%s/api/%s/cenr/json" % (HOST, cloud)
+              req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "svpn-feed/1.0"})
+              with urllib.request.urlopen(req, timeout=to, context=ssl.create_default_context()) as r:
+                  raw = r.read(52428801)
+              if len(raw) > 52428800:
+                  raise RuntimeError("Response exceeded size ceiling")
+              v4, v6 = _split(_find(json.loads(raw.decode("utf-8")), []))
+              if len(v4) + len(v6) < mn:
+                  raise RuntimeError("Only %d valid IPs found; refusing to publish" % (len(v4) + len(v6)))
+              for key, ips, fam in ((k4, v4, "IPv4"), (k6, v6, "IPv6")):
+                  s3.put_object(Bucket=bucket, Key=key,
+                                Body=_body(ips, cloud, fam).encode("utf-8"),
+                                ContentType="text/plain; charset=utf-8",
+                                CacheControl="max-age=300")
+              return {"ipv4": len(v4), "ipv6": len(v6)}
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FeedFunction.Arn
+          Id: FeedFunctionTarget
+
+  PermissionForEvents:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FeedFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  InitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: InvokeFeedFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt FeedFunction.Arn
+
+  InitFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt InitRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3, cfnresponse
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      boto3.client("lambda").invoke(
+                          FunctionName=event["ResourceProperties"]["FunctionName"],
+                          InvocationType="Event")
+              except Exception as e:
+                  print("init invoke (non-fatal):", e)
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  InitInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: FeedFunction
+    Properties:
+      ServiceToken: !GetAtt InitFunction.Arn
+      FunctionName: !Ref FeedFunction
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UseCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-svpn-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Zscaler SVPN feed
+        DefaultCacheBehavior:
+          TargetOriginId: s3origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        Origins:
+          - Id: s3origin
+            DomainName: !GetAtt FeedBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+
+Outputs:
+  BucketName:
+    Description: S3 bucket holding the feed files.
+    Value: !Ref FeedBucket
+  FeedUrlIPv4:
+    Description: URL to configure as the FortiGate IPv4 external threat feed.
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv4.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv4.txt'
+  FeedUrlIPv6:
+    Description: URL to configure as the FortiGate IPv6 external threat feed.
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv6.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv6.txt'
