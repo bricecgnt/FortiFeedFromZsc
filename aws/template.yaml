@@ -272,7 +272,7 @@ Resources:
       Timeout: 30
       Code:
         ZipFile: |
-          import boto3, cfnresponse
+          import boto3, json, urllib.request
           def handler(event, context):
               try:
                   if event["RequestType"] in ("Create", "Update"):
@@ -281,7 +281,18 @@ Resources:
                           InvocationType="Event")
               except Exception as e:
                   print("init invoke (non-fatal):", e)
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              body = json.dumps({
+                  "Status": "SUCCESS",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "PhysicalResourceId": event.get("PhysicalResourceId", event["LogicalResourceId"]),
+                  "Data": {}
+              })
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body.encode(), method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))})
+              urllib.request.urlopen(req)
 
   InitInvoke:
     Type: AWS::CloudFormation::CustomResource
