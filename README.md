@@ -57,11 +57,18 @@ Zscaler config (HTTPS)
 
 ## Deploy on AWS (one click)
 
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?templateURL=https://raw.githubusercontent.com/bricecgnt/FortiFeedFromZsc/main/aws/template.yaml&stackName=zscaler-svpn-feed)
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/create/review?templateURL=https://zscaler-feed-templates-11022.s3.eu-west-1.amazonaws.com/zscaler-svpn-fortigate/template.yaml&stackName=zscaler-svpn-feed)
 
-Replace `bricecgnt/FortiFeedFromZsc` and the `v0.1.0` tag in the link above with your published
-repository and release tag. The button opens the CloudFormation console in **your**
-account, pre-filled with the template. Review the parameters and create the stack.
+The button opens the CloudFormation console in **your** account, pre-filled with the
+template. Review the parameters and create the stack.
+
+> **Why an S3 URL?** AWS CloudFormation's quick-create only accepts a template URL
+> hosted on Amazon S3 — it rejects raw GitHub URLs (`TemplateURL must be a supported
+> URL`). The template above is the same content as `aws/template.yaml` in this repo,
+> published to a public S3 object in `eu-west-1`. To host your own copy: upload
+> `aws/template.yaml` to an S3 bucket and point the button's `templateURL` at it.
+> Alternatively, skip the button entirely — in the CloudFormation console choose
+> **Create stack → Upload a template file** and select `aws/template.yaml`.
 
 The template creates: an S3 bucket (private, versioned, encrypted), the Lambda
 (code embedded inline), its IAM role (write to the two feed objects only), an
