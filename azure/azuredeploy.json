@@ -151,7 +151,7 @@
               },
               "inputs": {
                 "from": "@coalesce(body('HTTP_Get_Zscaler')?['svpnIPs'], createArray())",
-                "where": "@not(contains(item(), ':'))"
+                "where": "@and(contains(item(), '.'), not(contains(item(), ':')))"
               }
             },
             "Filter_v6": {
@@ -173,7 +173,7 @@
                   "Succeeded"
                 ]
               },
-              "inputs": "@concat('# Zscaler SVPN IPv4', decodeUriComponent('%0A'), join(union(body('Filter_v4'), body('Filter_v4')), decodeUriComponent('%0A')), decodeUriComponent('%0A'))"
+              "inputs": "@concat('# Zscaler SVPN IPv4', decodeUriComponent('%0A'), join(sort(union(body('Filter_v4'), body('Filter_v4'))), decodeUriComponent('%0A')), decodeUriComponent('%0A'))"
             },
             "Compose_v6": {
               "type": "Compose",
@@ -182,7 +182,7 @@
                   "Succeeded"
                 ]
               },
-              "inputs": "@concat('# Zscaler SVPN IPv6', decodeUriComponent('%0A'), join(union(body('Filter_v6'), body('Filter_v6')), decodeUriComponent('%0A')), decodeUriComponent('%0A'))"
+              "inputs": "@concat('# Zscaler SVPN IPv6', decodeUriComponent('%0A'), join(sort(union(body('Filter_v6'), body('Filter_v6'))), decodeUriComponent('%0A')), decodeUriComponent('%0A'))"
             },
             "Check_Min_Count": {
               "type": "If",
@@ -205,48 +205,94 @@
                 ]
               },
               "actions": {
-                "Put_IPv4": {
-                  "type": "Http",
-                  "inputs": {
-                    "method": "PUT",
-                    "uri": "@{concat('https://', parameters('storageAccount'), '.blob.core.windows.net/', parameters('containerName'), '/svpn_ipv4.txt')}",
-                    "headers": {
-                      "x-ms-blob-type": "BlockBlob",
-                      "x-ms-version": "2021-08-06",
-                      "Content-Type": "text/plain; charset=utf-8"
-                    },
-                    "body": "@outputs('Compose_v4')",
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "audience": "https://storage.azure.com/"
-                    }
-                  }
-                },
-                "Put_IPv6": {
-                  "type": "Http",
-                  "inputs": {
-                    "method": "PUT",
-                    "uri": "@{concat('https://', parameters('storageAccount'), '.blob.core.windows.net/', parameters('containerName'), '/svpn_ipv6.txt')}",
-                    "headers": {
-                      "x-ms-blob-type": "BlockBlob",
-                      "x-ms-version": "2021-08-06",
-                      "Content-Type": "text/plain; charset=utf-8"
-                    },
-                    "body": "@outputs('Compose_v6')",
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "audience": "https://storage.azure.com/"
+                "If_Has_IPv4": {
+                  "type": "If",
+                  "runAfter": {},
+                  "expression": {
+                    "and": [
+                      {
+                        "greater": [
+                          "@length(body('Filter_v4'))",
+                          0
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Put_IPv4": {
+                      "type": "Http",
+                      "runAfter": {},
+                      "inputs": {
+                        "method": "PUT",
+                        "uri": "@{concat('https://', parameters('storageAccount'), '.blob.core.windows.net/', parameters('containerName'), '/svpn_ipv4.txt')}",
+                        "headers": {
+                          "x-ms-blob-type": "BlockBlob",
+                          "x-ms-version": "2021-08-06",
+                          "Content-Type": "text/plain; charset=utf-8"
+                        },
+                        "body": "@outputs('Compose_v4')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://storage.azure.com/"
+                        }
+                      }
                     }
                   },
-                  "runAfter": {
-                    "Put_IPv4": [
-                      "Succeeded"
+                  "else": {
+                    "actions": {}
+                  }
+                },
+                "If_Has_IPv6": {
+                  "type": "If",
+                  "runAfter": {},
+                  "expression": {
+                    "and": [
+                      {
+                        "greater": [
+                          "@length(body('Filter_v6'))",
+                          0
+                        ]
+                      }
                     ]
+                  },
+                  "actions": {
+                    "Put_IPv6": {
+                      "type": "Http",
+                      "runAfter": {},
+                      "inputs": {
+                        "method": "PUT",
+                        "uri": "@{concat('https://', parameters('storageAccount'), '.blob.core.windows.net/', parameters('containerName'), '/svpn_ipv6.txt')}",
+                        "headers": {
+                          "x-ms-blob-type": "BlockBlob",
+                          "x-ms-version": "2021-08-06",
+                          "Content-Type": "text/plain; charset=utf-8"
+                        },
+                        "body": "@outputs('Compose_v6')",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "audience": "https://storage.azure.com/"
+                        }
+                      }
+                    }
+                  },
+                  "else": {
+                    "actions": {}
                   }
                 }
               },
               "else": {
-                "actions": {}
+                "actions": {
+                  "Terminate_Insufficient_IPs": {
+                    "type": "Terminate",
+                    "inputs": {
+                      "runStatus": "Failed",
+                      "runError": {
+                        "code": "InsufficientIPs",
+                        "message": "Fewer than minExpected valid IPs were found; existing feed preserved and run marked failed for visibility."
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -273,10 +319,10 @@
     {
       "type": "Microsoft.Authorization/roleAssignments",
       "apiVersion": "2022-04-01",
-      "name": "[guid(resourceGroup().id, variables('logicAppName'), 'blobcontrib')]",
-      "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+      "name": "[guid(resourceGroup().id, variables('logicAppName'), variables('containerName'), 'blobcontrib')]",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', variables('containerName'))]",
       "dependsOn": [
-        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', variables('storageAccountName'), 'default', variables('containerName'))]",
         "[resourceId('Microsoft.Logic/workflows', variables('logicAppName'))]"
       ],
       "properties": {
@@ -298,6 +344,10 @@
     "exposureMode": {
       "type": "string",
       "value": "[parameters('exposureMode')]"
+    },
+    "accessNote": {
+      "type": "string",
+      "value": "[if(equals(parameters('exposureMode'), 'Private'), 'Private mode: the feed URLs require authentication and will return 403 anonymously. Front the container with Azure Front Door or generate a SAS URL for FortiGate.', 'PublicRead mode: the feed URLs are anonymously reachable over HTTPS.')]"
     }
   }
 }

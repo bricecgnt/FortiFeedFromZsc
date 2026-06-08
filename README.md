@@ -175,6 +175,24 @@ feed structure, or you want a fix, re-deploy from an updated template; running
 copies will not auto-update (by design). Pin the launch buttons to a release tag
 rather than `main` so deployments are reproducible.
 
+### Behaviour notes
+
+- **Per-family safety.** Beyond the global `MinExpected` / `minExpected` floor, a
+  family (IPv4 or IPv6) that returns zero entries on a given run is **not**
+  written, so a partial fetch can never overwrite a known-good per-family feed
+  with an empty file. The corresponding feed file simply keeps its last value.
+- **CIDR support.** Both host addresses and CIDR ranges are accepted. Host
+  addresses are emitted without a redundant `/32` or `/128` suffix, so existing
+  feeds are unchanged.
+
+### Teardown (AWS)
+
+The S3 bucket is created with `DeletionPolicy: Retain` because it is versioned and
+holds objects — an automatic delete would otherwise fail and leave the stack in
+`DELETE_FAILED`. To fully remove the solution: delete the CloudFormation stack,
+then empty and delete the retained bucket manually (its name is in the stack
+**Outputs** as `BucketName`).
+
 ## Repository layout
 
 ```

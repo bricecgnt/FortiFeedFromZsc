@@ -3,15 +3,19 @@ zscaler_svpn_to_fortigate_feed.py
 
 Reference copy of the AWS Lambda handler. The deployable copy is embedded inline
 inside aws/template.yaml so the deployed stack has NO dependency on this repo at
-runtime. This file exists only so the logic is easy to read and review.
+runtime. This file exists only so the logic is easy to read and review. Keep the
+two copies in sync (same logic).
 
 What it does:
   Fetches the published Zscaler SVPN (Z-Tunnel 2.0 server) IP list, validates
   every entry, removes duplicates, sorts, splits IPv4 from IPv6, and writes two
   plain-text files to S3 that a FortiGate External Threat Feed consumes.
 
-Safety: if fewer than MIN_EXPECTED valid IPs are found, it raises and writes
-nothing, so a bad fetch can never empty the feed.
+Safety:
+  - If fewer than MIN_EXPECTED valid IPs are found in total, it raises and writes
+    nothing, so a bad fetch can never empty the feed.
+  - A family (IPv4 or IPv6) that comes back empty for a run is NOT written, so a
+    partial fetch can never overwrite a good per-family feed with an empty file.
 
 Runtime: python3.12 (boto3 is provided by the Lambda runtime).
 Environment variables: ZSCALER_CLOUD, S3_BUCKET, S3_KEY_IPV4, S3_KEY_IPV6,
@@ -53,19 +57,37 @@ def _find(node, out):
     return out
 
 
+def _fmt(net):
+    """Render a network, dropping the prefix only for single-host entries.
+
+    A host is /32 for IPv4 or /128 for IPv6 (prefixlen == max_prefixlen); keying
+    on the family's max prefix avoids mistaking a legitimate IPv6 /32 range for a
+    host.
+    """
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
 def _split(ips):
-    """Validate, dedupe, sort; return (ipv4_list, ipv6_list)."""
+    """Validate, dedupe, sort; return (ipv4_list, ipv6_list).
+
+    Accepts host addresses and CIDR notation. Host addresses are emitted without
+    a redundant /32 or /128 suffix so the output stays identical to the previous
+    host-only format; networks keep their prefix length. Default routes
+    (0.0.0.0/0, ::/0) are rejected as a safety guard.
+    """
     v4, v6 = set(), set()
     for e in ips:
         e = e.strip()
         if not e:
             continue
         try:
-            o = ipaddress.ip_address(e)
+            o = ipaddress.ip_network(e, strict=False)
         except ValueError:
             continue
+        if o.prefixlen == 0:  # never publish a default route into the feed
+            continue
         (v4 if o.version == 4 else v6).add(o)
-    return [str(i) for i in sorted(v4)], [str(i) for i in sorted(v6)]
+    return [_fmt(n) for n in sorted(v4)], [_fmt(n) for n in sorted(v6)]
 
 
 def _body(ips, cloud, fam):
@@ -94,7 +116,12 @@ def handler(event, context):
     if len(v4) + len(v6) < mn:
         raise RuntimeError("Only %d valid IPs found; refusing to publish"
                            % (len(v4) + len(v6)))
+    # Skip a family that is empty this run so a partial fetch never overwrites a
+    # good per-family feed with an empty file.
     for key, ips, fam in ((k4, v4, "IPv4"), (k6, v6, "IPv6")):
+        if not ips:
+            print("No %s entries this run; leaving existing feed untouched." % fam)
+            continue
         s3.put_object(Bucket=bucket, Key=key,
                       Body=_body(ips, cloud, fam).encode("utf-8"),
                       ContentType="text/plain; charset=utf-8",
