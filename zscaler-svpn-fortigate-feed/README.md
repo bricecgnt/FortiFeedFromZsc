@@ -57,9 +57,9 @@ Zscaler config (HTTPS)
 
 ## Deploy on AWS (one click)
 
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?templateURL=https://raw.githubusercontent.com/OWNER/REPO/v1.0.0/aws/template.yaml&stackName=zscaler-svpn-feed)
+[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?templateURL=https://raw.githubusercontent.com/bricecgnt/zscaler-svpn-fortigate-feed/v0.1.0/aws/template.yaml&stackName=zscaler-svpn-feed)
 
-Replace `OWNER/REPO` and the `v1.0.0` tag in the link above with your published
+Replace `bricecgnt/zscaler-svpn-fortigate-feed` and the `v0.1.0` tag in the link above with your published
 repository and release tag. The button opens the CloudFormation console in **your**
 account, pre-filled with the template. Review the parameters and create the stack.
 
@@ -83,9 +83,9 @@ The feed URLs are shown in the stack **Outputs** (`FeedUrlIPv4`, `FeedUrlIPv6`).
 
 ## Deploy on Azure (one click)
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FOWNER%2FREPO%2Fv1.0.0%2Fazure%2Fazuredeploy.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fbricecgnt%2Fzscaler-svpn-fortigate-feed%2Fv0.1.0%2Fazure%2Fazuredeploy.json)
 
-Replace `OWNER`, `REPO`, and `v1.0.0` in the link (the raw URL must be
+Replace `bricecgnt`, `zscaler-svpn-fortigate-feed`, and `v0.1.0` in the link (the raw URL must be
 URL-encoded, as shown). The button opens a custom deployment in **your**
 subscription.
 
