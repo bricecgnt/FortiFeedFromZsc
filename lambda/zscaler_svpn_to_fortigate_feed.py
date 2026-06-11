@@ -7,23 +7,43 @@ runtime. This file exists only so the logic is easy to read and review. Keep the
 two copies in sync (same logic).
 
 What it does:
-  Fetches the published Zscaler SVPN (Z-Tunnel 2.0 server) IP list, validates
-  every entry, removes duplicates, sorts, splits IPv4 from IPv6, and writes two
-  text variants per family to S3:
+  For each category selected via CATEGORIES (svpn and/or zpa):
+    - svpn: fetches the published Zscaler SVPN (Z-Tunnel 2.0 server) IP list
+      (cenr/json). Used for routing/PBR (steer Z-Tunnel 2.0 traffic off an
+      IPsec tunnel) -- never for security allow-listing.
+    - zpa: fetches the published ZPA app-connector IP ranges (zpa/json). Used
+      for security allow-listing (whitelist) -- never for routing. Only
+      supported on clouds present in ZPA_PATHS (currently zscaler.net and
+      zscalertwo.net); on other clouds the category is silently skipped, and
+      any fetch/parse failure is non-fatal so it never blocks the svpn feed.
+
+  For each category, every entry is validated, deduplicated, sorted, split
+  IPv4 vs IPv6, and written as two text variants per family to S3:
     - a commented variant (`#` header line) for FortiGate, Palo Alto EDL,
       Check Point, and Juniper SRX, which all ignore `#` comment lines, and
-    - a plain variant (no comment line) for Cisco Secure Firewall Security
-      Intelligence feeds, which do not support comments at all.
+    - a plain `_cisco` variant (no comment line) for Cisco Secure Firewall
+      Security Intelligence feeds, which do not support comments at all.
 
 Safety:
-  - If fewer than MIN_EXPECTED valid IPs are found in total, it raises and writes
-    nothing, so a bad fetch can never empty the feed.
-  - A family (IPv4 or IPv6) that comes back empty for a run is NOT written, so a
-    partial fetch can never overwrite a good per-family feed with an empty file.
+  - svpn: if fewer than MIN_EXPECTED valid IPs are found in total, it raises
+    and writes nothing, so a bad fetch can never empty the feed.
+  - zpa: if fewer than MIN_EXPECTED valid IPs are found in total, the category
+    is skipped for this run (existing files untouched); this is logged, not
+    raised, since zpa support is best-effort.
+  - A family (IPv4 or IPv6) that comes back empty for a run is NOT written, so
+    a partial fetch can never overwrite a good per-family feed with an empty
+    file.
 
 Runtime: python3.12 (boto3 is provided by the Lambda runtime).
-Environment variables: ZSCALER_CLOUD, S3_BUCKET, S3_KEY_IPV4, S3_KEY_IPV6,
-S3_KEY_IPV4_PLAIN, S3_KEY_IPV6_PLAIN, MIN_EXPECTED, HTTP_TIMEOUT.
+Environment variables: ZSCALER_CLOUD, S3_BUCKET, CATEGORIES, MIN_EXPECTED,
+HTTP_TIMEOUT.
+
+Output keys (always, regardless of CATEGORIES content -- only categories
+selected and supported for the chosen cloud are written):
+  zscaler/svpn_ipv4.txt, zscaler/svpn_ipv4_cisco.txt,
+  zscaler/svpn_ipv6.txt, zscaler/svpn_ipv6_cisco.txt,
+  zscaler/zpa_ipv4.txt,  zscaler/zpa_ipv4_cisco.txt,
+  zscaler/zpa_ipv6.txt,  zscaler/zpa_ipv6_cisco.txt
 
 Community solution, provided as-is, without warranty. Not an official Zscaler
 product or offering.
@@ -38,46 +58,65 @@ from datetime import datetime, timezone
 
 import boto3
 
-HOST = "config.zscaler.com"  # pinned; only the cloud token below is variable
+HOST = "config.zscaler.com"  # pinned; only the path tokens below are variable
 CLOUDS = {
     "zscaler.net", "zscalertwo.net", "zscalerthree.net", "zscalerten.net",
     "zscalereleven.net", "zscalertwelve.net", "zscalerbeta.net",
     "zspreview.net", "zscloud.net", "zscalergov.us",
 }
+
+# Per-cloud ZPA endpoint *path* on the pinned HOST above. Confirmed-only
+# allowlist of full paths -- the shape is NOT a simple per-cloud pattern (e.g.
+# zscaler.net uses "/api/private.zscaler.com/zpa/json" while zscalertwo.net
+# uses "/zpatwo.net/zpa": no "/api/" prefix, no "/json" suffix). A cloud with
+# no entry here does not support the zpa category yet.
+ZPA_PATHS = {
+    "zscaler.net": "/api/private.zscaler.com/zpa/json",
+    "zscalertwo.net": "/zpatwo.net/zpa",
+}
+
 s3 = boto3.client("s3")
 
 
-def _find(node, out):
+def _fs(node, out):
     """Collect every value under any 'svpnIPs' key, wherever it appears."""
     if isinstance(node, dict):
         for k, v in node.items():
             if k == "svpnIPs" and isinstance(v, list):
                 out += [x for x in v if isinstance(x, str)]
             else:
-                _find(v, out)
+                _fs(v, out)
     elif isinstance(node, list):
         for i in node:
-            _find(i, out)
+            _fs(i, out)
     return out
 
 
-def _fmt(net):
+def _fz(doc):
+    """Flatten the 'IPs' arrays from each entry of a ZPA zpa/json 'content' list."""
+    out = []
+    for e in (doc.get("content") or []):
+        if isinstance(e, dict) and isinstance(e.get("IPs"), list):
+            out += [x for x in e["IPs"] if isinstance(x, str)]
+    return out
+
+
+def _fmt(n):
     """Render a network, dropping the prefix only for single-host entries.
 
     A host is /32 for IPv4 or /128 for IPv6 (prefixlen == max_prefixlen); keying
     on the family's max prefix avoids mistaking a legitimate IPv6 /32 range for a
     host.
     """
-    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+    return str(n.network_address) if n.prefixlen == n.max_prefixlen else str(n)
 
 
 def _split(ips):
     """Validate, dedupe, sort; return (ipv4_list, ipv6_list).
 
     Accepts host addresses and CIDR notation. Host addresses are emitted without
-    a redundant /32 or /128 suffix so the output stays identical to the previous
-    host-only format; networks keep their prefix length. Default routes
-    (0.0.0.0/0, ::/0) are rejected as a safety guard.
+    a redundant /32 or /128 suffix; networks keep their prefix length. Default
+    routes (0.0.0.0/0, ::/0) are rejected as a safety guard.
     """
     v4, v6 = set(), set()
     for e in ips:
@@ -94,16 +133,45 @@ def _split(ips):
     return [_fmt(n) for n in sorted(v4)], [_fmt(n) for n in sorted(v6)]
 
 
-def _body(ips, cloud, fam):
+def _body(ips, cloud, cat, fam):
     """Commented variant: FortiGate, Palo Alto EDL, Check Point, Juniper SRX."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return ("# Zscaler SVPN %s cloud=%s generated=%s count=%d\n"
-            % (fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
+    return ("# Zscaler %s %s cloud=%s generated=%s count=%d\n"
+            % (cat, fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
 
 
-def _body_plain(ips):
-    """Plain variant: Cisco Secure Firewall (no '#' comment support)."""
-    return "\n".join(ips) + "\n"
+def _get(path, to):
+    """Fetch and JSON-decode a path on the pinned HOST, with a size ceiling."""
+    req = urllib.request.Request(
+        "https://%s%s" % (HOST, path),
+        headers={"Accept": "application/json", "User-Agent": "svpn-feed/1.0"})
+    with urllib.request.urlopen(req, timeout=to, context=ssl.create_default_context()) as r:
+        raw = r.read(52428801)
+    if len(raw) > 52428800:
+        raise RuntimeError("Response exceeded size ceiling")
+    return json.loads(raw.decode("utf-8"))
+
+
+def _pub(bucket, prefix, cat, cloud, v4, v6, mn):
+    """Write commented + plain ('_cisco') variants per family under prefix.
+
+    If the total count is below mn, skip entirely (existing files untouched).
+    A family that is empty this run is also skipped, so a partial fetch can
+    never overwrite a good per-family feed with an empty file.
+    """
+    if len(v4) + len(v6) < mn:
+        print("Only %d %s IPs found; skipping." % (len(v4) + len(v6), cat))
+        return
+    for ips, fam, suf in ((v4, "IPv4", "ipv4"), (v6, "IPv6", "ipv6")):
+        if not ips:
+            print("No %s %s entries this run; feed untouched." % (cat, fam))
+            continue
+        s3.put_object(Bucket=bucket, Key=prefix + suf + ".txt",
+                      Body=_body(ips, cloud, cat, fam).encode(),
+                      ContentType="text/plain; charset=utf-8", CacheControl="max-age=300")
+        s3.put_object(Bucket=bucket, Key=prefix + suf + "_cisco.txt",
+                      Body=("\n".join(ips) + "\n").encode(),
+                      ContentType="text/plain; charset=utf-8", CacheControl="max-age=300")
 
 
 def handler(event, context):
@@ -111,35 +179,20 @@ def handler(event, context):
     if cloud not in CLOUDS:
         raise ValueError("Unrecognised Zscaler cloud: %s" % cloud)
     bucket = os.environ["S3_BUCKET"]
-    k4 = os.environ.get("S3_KEY_IPV4", "zscaler/svpn_ipv4.txt")
-    k6 = os.environ.get("S3_KEY_IPV6", "zscaler/svpn_ipv6.txt")
-    k4p = os.environ.get("S3_KEY_IPV4_PLAIN", "zscaler/svpn_ipv4_cisco.txt")
-    k6p = os.environ.get("S3_KEY_IPV6_PLAIN", "zscaler/svpn_ipv6_cisco.txt")
     mn = int(os.environ.get("MIN_EXPECTED", "10"))
     to = int(os.environ.get("HTTP_TIMEOUT", "20"))
-    url = "https://%s/api/%s/cenr/json" % (HOST, cloud)
-    req = urllib.request.Request(
-        url, headers={"Accept": "application/json", "User-Agent": "svpn-feed/1.0"})
-    with urllib.request.urlopen(req, timeout=to, context=ssl.create_default_context()) as r:
-        raw = r.read(52428801)
-    if len(raw) > 52428800:
-        raise RuntimeError("Response exceeded size ceiling")
-    v4, v6 = _split(_find(json.loads(raw.decode("utf-8")), []))
-    if len(v4) + len(v6) < mn:
-        raise RuntimeError("Only %d valid IPs found; refusing to publish"
-                           % (len(v4) + len(v6)))
-    # Skip a family that is empty this run so a partial fetch never overwrites a
-    # good per-family feed with an empty file.
-    for key, keyp, ips, fam in ((k4, k4p, v4, "IPv4"), (k6, k6p, v6, "IPv6")):
-        if not ips:
-            print("No %s entries this run; leaving existing feed untouched." % fam)
-            continue
-        s3.put_object(Bucket=bucket, Key=key,
-                      Body=_body(ips, cloud, fam).encode("utf-8"),
-                      ContentType="text/plain; charset=utf-8",
-                      CacheControl="max-age=300")
-        s3.put_object(Bucket=bucket, Key=keyp,
-                      Body=_body_plain(ips).encode("utf-8"),
-                      ContentType="text/plain; charset=utf-8",
-                      CacheControl="max-age=300")
-    return {"ipv4": len(v4), "ipv6": len(v6)}
+    cats = {c.strip() for c in os.environ.get("CATEGORIES", "svpn").lower().split(",") if c.strip()}
+
+    if "svpn" in cats:
+        v4, v6 = _split(_fs(_get("/api/%s/cenr/json" % cloud, to), []))
+        if len(v4) + len(v6) < mn:
+            raise RuntimeError("Only %d valid SVPN IPs found; refusing to publish"
+                               % (len(v4) + len(v6)))
+        _pub(bucket, "zscaler/svpn_", "SVPN", cloud, v4, v6, 0)
+
+    if "zpa" in cats and cloud in ZPA_PATHS:
+        try:
+            v4, v6 = _split(_fz(_get(ZPA_PATHS[cloud], to)))
+            _pub(bucket, "zscaler/zpa_", "ZPA", cloud, v4, v6, mn)
+        except Exception as e:
+            print("ZPA fetch failed (non-fatal):", e)

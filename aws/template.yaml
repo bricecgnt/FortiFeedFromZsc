@@ -45,6 +45,16 @@ Parameters:
     Default: 10
     MinValue: 1
     Description: Refuse to publish if fewer than this many valid IPs are found.
+  Categories:
+    Type: String
+    Default: svpn
+    AllowedPattern: '^[a-z]+(,[a-z]+)*$'
+    Description: >-
+      Comma-separated list of feed categories to publish: svpn (Z-Tunnel 2.0,
+      for routing/PBR exclusion) and/or zpa (ZPA app-connector ranges, for
+      security allow-listing). ZPA is currently only supported for the
+      zscaler.net and zscalertwo.net clouds; on other clouds the zpa category
+      is silently skipped.
 
 Conditions:
   UsePublicRead: !Equals [!Ref ExposureMode, PublicRead]
@@ -142,10 +152,7 @@ Resources:
         Variables:
           ZSCALER_CLOUD: !Ref ZscalerCloud
           S3_BUCKET: !Ref FeedBucket
-          S3_KEY_IPV4: zscaler/svpn_ipv4.txt
-          S3_KEY_IPV6: zscaler/svpn_ipv6.txt
-          S3_KEY_IPV4_PLAIN: zscaler/svpn_ipv4_cisco.txt
-          S3_KEY_IPV6_PLAIN: zscaler/svpn_ipv6_cisco.txt
+          CATEGORIES: !Ref Categories
           MIN_EXPECTED: !Sub '${MinExpected}'
           HTTP_TIMEOUT: '20'
       Code:
@@ -158,24 +165,34 @@ Resources:
           CLOUDS = {"zscaler.net", "zscalertwo.net", "zscalerthree.net", "zscalerten.net",
                     "zscalereleven.net", "zscalertwelve.net", "zscalerbeta.net",
                     "zspreview.net", "zscloud.net", "zscalergov.us"}
+          ZPA_PATHS = {"zscaler.net": "/api/private.zscaler.com/zpa/json",
+                       "zscalertwo.net": "/zpatwo.net/zpa"}
           s3 = boto3.client("s3")
 
 
-          def _find(node, out):
+          def _fs(node, out):
               if isinstance(node, dict):
                   for k, v in node.items():
                       if k == "svpnIPs" and isinstance(v, list):
                           out += [x for x in v if isinstance(x, str)]
                       else:
-                          _find(v, out)
+                          _fs(v, out)
               elif isinstance(node, list):
                   for i in node:
-                      _find(i, out)
+                      _fs(i, out)
               return out
 
 
-          def _fmt(net):
-              return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+          def _fz(doc):
+              out = []
+              for e in (doc.get("content") or []):
+                  if isinstance(e, dict) and isinstance(e.get("IPs"), list):
+                      out += [x for x in e["IPs"] if isinstance(x, str)]
+              return out
+
+
+          def _fmt(n):
+              return str(n.network_address) if n.prefixlen == n.max_prefixlen else str(n)
 
 
           def _split(ips):
@@ -194,13 +211,35 @@ Resources:
               return [_fmt(n) for n in sorted(v4)], [_fmt(n) for n in sorted(v6)]
 
 
-          def _body(ips, cloud, fam):
+          def _body(ips, cloud, cat, fam):
               ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-              return ("# Zscaler SVPN %s cloud=%s generated=%s count=%d\n" % (fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
+              return ("# Zscaler %s %s cloud=%s generated=%s count=%d\n" % (cat, fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
 
 
-          def _body_plain(ips):
-              return "\n".join(ips) + "\n"
+          def _get(path, to):
+              req = urllib.request.Request("https://%s%s" % (HOST, path),
+                                            headers={"Accept": "application/json", "User-Agent": "svpn-feed/1.0"})
+              with urllib.request.urlopen(req, timeout=to, context=ssl.create_default_context()) as r:
+                  raw = r.read(52428801)
+              if len(raw) > 52428800:
+                  raise RuntimeError("Response exceeded size ceiling")
+              return json.loads(raw.decode("utf-8"))
+
+
+          def _pub(bucket, prefix, cat, cloud, v4, v6, mn):
+              if len(v4) + len(v6) < mn:
+                  print("Only %d %s IPs found; skipping." % (len(v4) + len(v6), cat))
+                  return
+              for ips, fam, suf in ((v4, "IPv4", "ipv4"), (v6, "IPv6", "ipv6")):
+                  if not ips:
+                      print("No %s %s entries this run; feed untouched." % (cat, fam))
+                      continue
+                  s3.put_object(Bucket=bucket, Key=prefix + suf + ".txt",
+                                Body=_body(ips, cloud, cat, fam).encode(),
+                                ContentType="text/plain; charset=utf-8", CacheControl="max-age=300")
+                  s3.put_object(Bucket=bucket, Key=prefix + suf + "_cisco.txt",
+                                Body=("\n".join(ips) + "\n").encode(),
+                                ContentType="text/plain; charset=utf-8", CacheControl="max-age=300")
 
 
           def handler(event, context):
@@ -208,34 +247,22 @@ Resources:
               if cloud not in CLOUDS:
                   raise ValueError("Unrecognised Zscaler cloud: %s" % cloud)
               bucket = os.environ["S3_BUCKET"]
-              k4 = os.environ.get("S3_KEY_IPV4", "zscaler/svpn_ipv4.txt")
-              k6 = os.environ.get("S3_KEY_IPV6", "zscaler/svpn_ipv6.txt")
-              k4p = os.environ.get("S3_KEY_IPV4_PLAIN", "zscaler/svpn_ipv4_cisco.txt")
-              k6p = os.environ.get("S3_KEY_IPV6_PLAIN", "zscaler/svpn_ipv6_cisco.txt")
               mn = int(os.environ.get("MIN_EXPECTED", "10"))
               to = int(os.environ.get("HTTP_TIMEOUT", "20"))
-              url = "https://%s/api/%s/cenr/json" % (HOST, cloud)
-              req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "svpn-feed/1.0"})
-              with urllib.request.urlopen(req, timeout=to, context=ssl.create_default_context()) as r:
-                  raw = r.read(52428801)
-              if len(raw) > 52428800:
-                  raise RuntimeError("Response exceeded size ceiling")
-              v4, v6 = _split(_find(json.loads(raw.decode("utf-8")), []))
-              if len(v4) + len(v6) < mn:
-                  raise RuntimeError("Only %d valid IPs found; refusing to publish" % (len(v4) + len(v6)))
-              for key, keyp, ips, fam in ((k4, k4p, v4, "IPv4"), (k6, k6p, v6, "IPv6")):
-                  if not ips:
-                      print("No %s entries this run; leaving existing feed untouched." % fam)
-                      continue
-                  s3.put_object(Bucket=bucket, Key=key,
-                                Body=_body(ips, cloud, fam).encode("utf-8"),
-                                ContentType="text/plain; charset=utf-8",
-                                CacheControl="max-age=300")
-                  s3.put_object(Bucket=bucket, Key=keyp,
-                                Body=_body_plain(ips).encode("utf-8"),
-                                ContentType="text/plain; charset=utf-8",
-                                CacheControl="max-age=300")
-              return {"ipv4": len(v4), "ipv6": len(v6)}
+              cats = {c.strip() for c in os.environ.get("CATEGORIES", "svpn").lower().split(",") if c.strip()}
+
+              if "svpn" in cats:
+                  v4, v6 = _split(_fs(_get("/api/%s/cenr/json" % cloud, to), []))
+                  if len(v4) + len(v6) < mn:
+                      raise RuntimeError("Only %d valid SVPN IPs found; refusing to publish" % (len(v4) + len(v6)))
+                  _pub(bucket, "zscaler/svpn_", "SVPN", cloud, v4, v6, 0)
+
+              if "zpa" in cats and cloud in ZPA_PATHS:
+                  try:
+                      v4, v6 = _split(_fz(_get(ZPA_PATHS[cloud], to)))
+                      _pub(bucket, "zscaler/zpa_", "ZPA", cloud, v4, v6, mn)
+                  except Exception as e:
+                      print("ZPA fetch failed (non-fatal):", e)
 
   ScheduleRule:
     Type: AWS::Events::Rule
@@ -378,3 +405,37 @@ Outputs:
       - UseCloudFront
       - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv6_cisco.txt'
       - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv6_cisco.txt'
+  FeedUrlZpaIPv4:
+    Description: >-
+      ZPA IPv4 feed URL (commented, '#' header), for security allow-listing.
+      Only published if 'zpa' is in Categories and the selected cloud
+      supports ZPA (currently zscaler.net, zscalertwo.net).
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/zpa_ipv4.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/zpa_ipv4.txt'
+  FeedUrlZpaIPv6:
+    Description: >-
+      ZPA IPv6 feed URL (commented, '#' header), for security allow-listing.
+      Only published if 'zpa' is in Categories and the selected cloud
+      supports ZPA (currently zscaler.net, zscalertwo.net).
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/zpa_ipv6.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/zpa_ipv6.txt'
+  FeedUrlZpaIPv4Cisco:
+    Description: >-
+      ZPA IPv4 feed URL (plain, no comment lines), for Cisco Secure Firewall
+      Security Intelligence feeds. Same availability caveats as FeedUrlZpaIPv4.
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/zpa_ipv4_cisco.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/zpa_ipv4_cisco.txt'
+  FeedUrlZpaIPv6Cisco:
+    Description: >-
+      ZPA IPv6 feed URL (plain, no comment lines), for Cisco Secure Firewall
+      Security Intelligence feeds. Same availability caveats as FeedUrlZpaIPv6.
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/zpa_ipv6_cisco.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/zpa_ipv6_cisco.txt'

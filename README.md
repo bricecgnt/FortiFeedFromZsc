@@ -1,9 +1,19 @@
-# Zscaler SVPN → multi-vendor firewall feed
+# Zscaler SVPN / ZPA → multi-vendor firewall feed
 
-Automatically publish the Zscaler **SVPN (Z-Tunnel 2.0 server) IP list** as a feed
-that **FortiGate, Palo Alto (EDL), Check Point, Juniper SRX, and Cisco Secure
-Firewall** can all consume, so you can keep Z-Tunnel 2.0 traffic off a
-site-to-site IPsec tunnel without maintaining the IP list by hand.
+Automatically publish Zscaler IP lists as feeds that **FortiGate, Palo Alto
+(EDL), Check Point, Juniper SRX, and Cisco Secure Firewall** can all consume,
+so you don't have to maintain these lists by hand. Two independent
+categories are available, selected via the `Categories` parameter:
+
+- **`svpn`** — the **SVPN (Z-Tunnel 2.0 server) IP list**, for **routing/PBR**
+  (keep Z-Tunnel 2.0 traffic off a site-to-site IPsec tunnel).
+- **`zpa`** — the **ZPA app-connector IP ranges**, for **security
+  allow-listing** (whitelist Zscaler infrastructure in your firewall policy).
+  Currently only available for the `zscaler.net` and `zscalertwo.net` clouds
+  (see [ZPA availability](#zpa-availability)).
+
+These two categories are always published as **separate** feed files — see
+[Usage model](#usage-model-routing-vs-allow-listing).
 
 > **Disclaimer.** This is a community solution provided **as-is, without warranty of
 > any kind**. It is **not an official Zscaler product, offering, or supported
@@ -18,47 +28,72 @@ repo and existing deployments keep running.
 
 ## What it does
 
-Zscaler publishes the current SVPN IP list at
-`https://config.zscaler.com/api/<cloud>/cenr/json` (the IPs sit in a top-level
-`svpnIPs` block). This solution, on a schedule:
+For each category in `Categories` (default `svpn`), this solution, on a schedule:
 
-1. downloads that document over HTTPS,
-2. extracts the `svpnIPs`, validates each entry, removes duplicates, and splits
+1. downloads the relevant Zscaler document over HTTPS (pinned to
+   `config.zscaler.com`),
+2. extracts the IP list, validates each entry, removes duplicates, and splits
    IPv4 from IPv6,
-3. refuses to publish if the result looks empty or too small (so a bad fetch can
-   never wipe your feed), and
+3. applies a safety floor before publishing (so a bad fetch can never wipe your
+   feed), and
 4. writes two text-file **variants** per IP family that firewalls pull on their
    own refresh timer:
-   - `svpn_ipv4.txt` / `svpn_ipv6.txt` — one IP/CIDR per line with a `#` comment
-     header. Use these for **FortiGate, Palo Alto EDL, Check Point, and Juniper
-     SRX**, which all ignore `#` comment lines.
-   - `svpn_ipv4_cisco.txt` / `svpn_ipv6_cisco.txt` — the same list with **no
-     comment line**. Use these for **Cisco Secure Firewall** (Security
+   - `<category>_ipv4.txt` / `<category>_ipv6.txt` — one IP/CIDR per line with a
+     `#` comment header. Use these for **FortiGate, Palo Alto EDL, Check Point,
+     and Juniper SRX**, which all ignore `#` comment lines.
+   - `<category>_ipv4_cisco.txt` / `<category>_ipv6_cisco.txt` — the same list
+     with **no comment line**. Use these for **Cisco Secure Firewall** (Security
      Intelligence feeds reject `#` lines).
+
+`<category>` is `svpn` (from `https://config.zscaler.com/api/<cloud>/cenr/json`,
+the top-level `svpnIPs` block) or `zpa` (from the cloud's ZPA endpoint, see
+[ZPA availability](#zpa-availability)).
 
 ## Vendor compatibility
 
 | Vendor | Feature | File to use |
 |---|---|---|
-| FortiGate | External Threat Feed (IP Address) | `svpn_ipv4.txt` / `svpn_ipv6.txt` |
-| Palo Alto Networks | External Dynamic List (EDL), type "IP List" | `svpn_ipv4.txt` / `svpn_ipv6.txt` |
-| Check Point | Network Feed (Custom Intelligence Feed) | `svpn_ipv4.txt` / `svpn_ipv6.txt` |
-| Juniper SRX | Dynamic Address / feed-server | `svpn_ipv4.txt` / `svpn_ipv6.txt` |
-| Cisco Secure Firewall | Security Intelligence feed (network list) | `svpn_ipv4_cisco.txt` / `svpn_ipv6_cisco.txt` |
+| FortiGate | External Threat Feed (IP Address) | `<category>_ipv4.txt` / `<category>_ipv6.txt` |
+| Palo Alto Networks | External Dynamic List (EDL), type "IP List" | `<category>_ipv4.txt` / `<category>_ipv6.txt` |
+| Check Point | Network Feed (Custom Intelligence Feed) | `<category>_ipv4.txt` / `<category>_ipv6.txt` |
+| Juniper SRX | Dynamic Address / feed-server | `<category>_ipv4.txt` / `<category>_ipv6.txt` |
+| Cisco Secure Firewall | Security Intelligence feed (network list) | `<category>_ipv4_cisco.txt` / `<category>_ipv6_cisco.txt` |
 
 All files are plain text, `Content-Type: text/plain; charset=utf-8`, one
 host/CIDR per line, refreshed on the schedule below.
 
-## Usage model: routing, not whitelisting
+## Usage model: routing vs allow-listing
 
-These feeds are **SVPN (Z-Tunnel 2.0) server addresses**. The intended use is a
-**routing/PBR match** — a policy route, SD-WAN rule, or route-map entry that
-steers Z-Tunnel 2.0 traffic *off* a site-to-site IPsec tunnel. They are **not**
-intended as a security allow-list/whitelist entry in a firewall policy. Keeping
-this distinction matters: a future release may add ZPA and data-center IP
-categories, which serve the opposite purpose (allow-listing Zscaler
-infrastructure in security policy) and will always be published as **separate**
-feed files so the two usages are never mixed.
+The two categories serve **opposite** purposes and are always published as
+**separate** feed files, never merged:
+
+- **`svpn` feeds are SVPN (Z-Tunnel 2.0) server addresses.** The intended use
+  is a **routing/PBR match** — a policy route, SD-WAN rule, or route-map entry
+  that steers Z-Tunnel 2.0 traffic *off* a site-to-site IPsec tunnel. They are
+  **not** intended as a security allow-list/whitelist entry in a firewall
+  policy.
+- **`zpa` feeds are ZPA app-connector IP ranges.** The intended use is the
+  **opposite**: a **security allow-list/whitelist** entry in a firewall policy
+  (an "allow" rule referencing the address object). They are **not** intended
+  for routing/PBR.
+
+Mixing these up is an operational footgun (route-excluding allow-listed
+destinations, or allow-listing the steering set) — keep them in separate
+policy constructs.
+
+## ZPA availability
+
+The ZPA endpoint shape differs per Zscaler cloud and is only confirmed for:
+
+| Cloud | ZPA endpoint |
+|---|---|
+| `zscaler.net` | `https://config.zscaler.com/api/private.zscaler.com/zpa/json` |
+| `zscalertwo.net` | `https://config.zscaler.com/zpatwo.net/zpa` |
+
+If `zpa` is included in `Categories` but the selected `ZscalerCloud` is not one
+of the above, the `zpa` category is **silently skipped** (logged, not an
+error) — only `svpn` files are published. Any transient ZPA fetch failure is
+also non-fatal and never blocks the `svpn` feed.
 
 ## Architecture
 
@@ -110,11 +145,19 @@ and optionally a CloudFront distribution.
 | `ZscalerCloud` | `zscaler.net` | Your Zscaler cloud |
 | `ScheduleExpression` | `rate(6 hours)` | Refresh cadence |
 | `ExposureMode` | `PublicRead` | `PublicRead` (direct S3 HTTPS) or `CloudFront` (private bucket + CDN) |
-| `MinExpected` | `10` | Safety floor before publishing |
+| `MinExpected` | `10` | Safety floor before publishing (per category) |
+| `Categories` | `svpn` | Comma list from `svpn`, `zpa` (e.g. `svpn,zpa`). See [ZPA availability](#zpa-availability). |
 
-The feed URLs are shown in the stack **Outputs**: `FeedUrlIPv4` / `FeedUrlIPv6`
-(commented variant — FortiGate, Palo Alto, Check Point, Juniper) and
-`FeedUrlIPv4Cisco` / `FeedUrlIPv6Cisco` (plain variant — Cisco Secure Firewall).
+The feed URLs are shown in the stack **Outputs**:
+- `FeedUrlIPv4` / `FeedUrlIPv6` and `FeedUrlIPv4Cisco` / `FeedUrlIPv6Cisco` —
+  `svpn` category, commented and Cisco-plain variants.
+- `FeedUrlZpaIPv4` / `FeedUrlZpaIPv6` and `FeedUrlZpaIPv4Cisco` /
+  `FeedUrlZpaIPv6Cisco` — `zpa` category (only populated with data if `zpa` is
+  selected and supported for your cloud).
+
+To change the selection later (e.g. add `zpa`), update the `Categories`
+parameter via a CloudFormation **stack update** — this is in-place (~1 minute),
+the URLs are unchanged, and the next scheduled run regenerates the new files.
 
 ---
 
@@ -144,17 +187,29 @@ The feed URLs are shown in the deployment **Outputs**: `feedUrlIPv4` /
 `feedUrlIPv6` (commented variant) and `feedUrlIPv4Cisco` / `feedUrlIPv6Cisco`
 (plain variant for Cisco).
 
+> **Note:** the Azure deployment currently supports only the `svpn` category.
+> The `zpa` category (`Categories=zpa` on AWS) is not yet available on Azure —
+> the Logic App workflow model can't easily replicate the ZPA response parsing.
+> This is tracked as a follow-up.
+
 ---
 
 ## After deploying: firewall side
 
 Use the **commented** feed URLs (`FeedUrlIPv4` / `FeedUrlIPv6` /
-`feedUrlIPv4` / `feedUrlIPv6`) for FortiGate, Palo Alto, Check Point, and
-Juniper. Use the **Cisco** URLs (`...Cisco`) only for Cisco Secure Firewall.
+`feedUrlIPv4` / `feedUrlIPv6`, or their `FeedUrlZpa*` equivalents) for
+FortiGate, Palo Alto, Check Point, and Juniper. Use the **Cisco** URLs
+(`...Cisco`) only for Cisco Secure Firewall.
 
-Remember the [usage model](#usage-model-routing-not-whitelisting): these are
-SVPN server addresses for **routing/PBR**, used to steer Z-Tunnel 2.0 traffic
-*off* an IPsec tunnel — not a security allow-list entry.
+Remember the [usage model](#usage-model-routing-vs-allow-listing):
+- `svpn` URLs are SVPN server addresses for **routing/PBR**, used to steer
+  Z-Tunnel 2.0 traffic *off* an IPsec tunnel — not a security allow-list entry.
+- `FeedUrlZpa*` URLs are ZPA app-connector ranges for a **security
+  allow-list/whitelist** entry — not for routing/PBR.
+
+The examples below use the `svpn` URLs and the routing/PBR usage model; for
+`zpa`, configure the equivalent object the same way but reference it from an
+**allow rule in your security policy** instead of a routing rule.
 
 ### FortiGate
 
@@ -253,17 +308,20 @@ rather than `main` so deployments are reproducible.
 
 ### Behaviour notes
 
-- **Per-family safety.** Beyond the global `MinExpected` / `minExpected` floor, a
-  family (IPv4 or IPv6) that returns zero entries on a given run is **not**
-  written, so a partial fetch can never overwrite a known-good per-family feed
-  with an empty file. The corresponding feed files (both the commented and the
-  Cisco plain variant) simply keep their last value.
+- **Per-category, per-family safety.** The `MinExpected` / `minExpected` floor
+  is applied per category: `svpn` raises (and writes nothing) if the total
+  count is too low; `zpa` is skipped for that run (logged, not an error) if
+  too low or unavailable. Within a category, a family (IPv4 or IPv6) that
+  returns zero entries on a given run is **not** written, so a partial fetch
+  can never overwrite a known-good per-family feed with an empty file. The
+  corresponding feed files (both the commented and the Cisco plain variant)
+  simply keep their last value.
 - **CIDR support.** Both host addresses and CIDR ranges are accepted. Host
   addresses are emitted without a redundant `/32` or `/128` suffix, so existing
   feeds are unchanged.
 - **Two variants, same data.** The commented and Cisco plain files always contain
-  the same IP set for a given family — only the presence of the `#` header line
-  differs.
+  the same IP set for a given category/family — only the presence of the `#`
+  header line differs.
 
 ### Teardown (AWS)
 
