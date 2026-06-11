@@ -9,7 +9,11 @@ two copies in sync (same logic).
 What it does:
   Fetches the published Zscaler SVPN (Z-Tunnel 2.0 server) IP list, validates
   every entry, removes duplicates, sorts, splits IPv4 from IPv6, and writes two
-  plain-text files to S3 that a FortiGate External Threat Feed consumes.
+  text variants per family to S3:
+    - a commented variant (`#` header line) for FortiGate, Palo Alto EDL,
+      Check Point, and Juniper SRX, which all ignore `#` comment lines, and
+    - a plain variant (no comment line) for Cisco Secure Firewall Security
+      Intelligence feeds, which do not support comments at all.
 
 Safety:
   - If fewer than MIN_EXPECTED valid IPs are found in total, it raises and writes
@@ -19,7 +23,7 @@ Safety:
 
 Runtime: python3.12 (boto3 is provided by the Lambda runtime).
 Environment variables: ZSCALER_CLOUD, S3_BUCKET, S3_KEY_IPV4, S3_KEY_IPV6,
-MIN_EXPECTED, HTTP_TIMEOUT.
+S3_KEY_IPV4_PLAIN, S3_KEY_IPV6_PLAIN, MIN_EXPECTED, HTTP_TIMEOUT.
 
 Community solution, provided as-is, without warranty. Not an official Zscaler
 product or offering.
@@ -91,9 +95,15 @@ def _split(ips):
 
 
 def _body(ips, cloud, fam):
+    """Commented variant: FortiGate, Palo Alto EDL, Check Point, Juniper SRX."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return ("# Zscaler SVPN %s cloud=%s generated=%s count=%d\n"
             % (fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
+
+
+def _body_plain(ips):
+    """Plain variant: Cisco Secure Firewall (no '#' comment support)."""
+    return "\n".join(ips) + "\n"
 
 
 def handler(event, context):
@@ -103,6 +113,8 @@ def handler(event, context):
     bucket = os.environ["S3_BUCKET"]
     k4 = os.environ.get("S3_KEY_IPV4", "zscaler/svpn_ipv4.txt")
     k6 = os.environ.get("S3_KEY_IPV6", "zscaler/svpn_ipv6.txt")
+    k4p = os.environ.get("S3_KEY_IPV4_PLAIN", "zscaler/svpn_ipv4_cisco.txt")
+    k6p = os.environ.get("S3_KEY_IPV6_PLAIN", "zscaler/svpn_ipv6_cisco.txt")
     mn = int(os.environ.get("MIN_EXPECTED", "10"))
     to = int(os.environ.get("HTTP_TIMEOUT", "20"))
     url = "https://%s/api/%s/cenr/json" % (HOST, cloud)
@@ -118,12 +130,16 @@ def handler(event, context):
                            % (len(v4) + len(v6)))
     # Skip a family that is empty this run so a partial fetch never overwrites a
     # good per-family feed with an empty file.
-    for key, ips, fam in ((k4, v4, "IPv4"), (k6, v6, "IPv6")):
+    for key, keyp, ips, fam in ((k4, k4p, v4, "IPv4"), (k6, k6p, v6, "IPv6")):
         if not ips:
             print("No %s entries this run; leaving existing feed untouched." % fam)
             continue
         s3.put_object(Bucket=bucket, Key=key,
                       Body=_body(ips, cloud, fam).encode("utf-8"),
+                      ContentType="text/plain; charset=utf-8",
+                      CacheControl="max-age=300")
+        s3.put_object(Bucket=bucket, Key=keyp,
+                      Body=_body_plain(ips).encode("utf-8"),
                       ContentType="text/plain; charset=utf-8",
                       CacheControl="max-age=300")
     return {"ipv4": len(v4), "ipv6": len(v6)}

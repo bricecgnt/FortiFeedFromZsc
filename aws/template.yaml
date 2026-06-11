@@ -144,6 +144,8 @@ Resources:
           S3_BUCKET: !Ref FeedBucket
           S3_KEY_IPV4: zscaler/svpn_ipv4.txt
           S3_KEY_IPV6: zscaler/svpn_ipv6.txt
+          S3_KEY_IPV4_PLAIN: zscaler/svpn_ipv4_cisco.txt
+          S3_KEY_IPV6_PLAIN: zscaler/svpn_ipv6_cisco.txt
           MIN_EXPECTED: !Sub '${MinExpected}'
           HTTP_TIMEOUT: '20'
       Code:
@@ -197,6 +199,10 @@ Resources:
               return ("# Zscaler SVPN %s cloud=%s generated=%s count=%d\n" % (fam, cloud, ts, len(ips))) + "\n".join(ips) + "\n"
 
 
+          def _body_plain(ips):
+              return "\n".join(ips) + "\n"
+
+
           def handler(event, context):
               cloud = os.environ.get("ZSCALER_CLOUD", "zscaler.net").strip().lower()
               if cloud not in CLOUDS:
@@ -204,6 +210,8 @@ Resources:
               bucket = os.environ["S3_BUCKET"]
               k4 = os.environ.get("S3_KEY_IPV4", "zscaler/svpn_ipv4.txt")
               k6 = os.environ.get("S3_KEY_IPV6", "zscaler/svpn_ipv6.txt")
+              k4p = os.environ.get("S3_KEY_IPV4_PLAIN", "zscaler/svpn_ipv4_cisco.txt")
+              k6p = os.environ.get("S3_KEY_IPV6_PLAIN", "zscaler/svpn_ipv6_cisco.txt")
               mn = int(os.environ.get("MIN_EXPECTED", "10"))
               to = int(os.environ.get("HTTP_TIMEOUT", "20"))
               url = "https://%s/api/%s/cenr/json" % (HOST, cloud)
@@ -215,12 +223,16 @@ Resources:
               v4, v6 = _split(_find(json.loads(raw.decode("utf-8")), []))
               if len(v4) + len(v6) < mn:
                   raise RuntimeError("Only %d valid IPs found; refusing to publish" % (len(v4) + len(v6)))
-              for key, ips, fam in ((k4, v4, "IPv4"), (k6, v6, "IPv6")):
+              for key, keyp, ips, fam in ((k4, k4p, v4, "IPv4"), (k6, k6p, v6, "IPv6")):
                   if not ips:
                       print("No %s entries this run; leaving existing feed untouched." % fam)
                       continue
                   s3.put_object(Bucket=bucket, Key=key,
                                 Body=_body(ips, cloud, fam).encode("utf-8"),
+                                ContentType="text/plain; charset=utf-8",
+                                CacheControl="max-age=300")
+                  s3.put_object(Bucket=bucket, Key=keyp,
+                                Body=_body_plain(ips).encode("utf-8"),
                                 ContentType="text/plain; charset=utf-8",
                                 CacheControl="max-age=300")
               return {"ipv4": len(v4), "ipv6": len(v6)}
@@ -335,14 +347,34 @@ Outputs:
     Description: S3 bucket holding the feed files.
     Value: !Ref FeedBucket
   FeedUrlIPv4:
-    Description: URL to configure as the FortiGate IPv4 external threat feed.
+    Description: >-
+      IPv4 feed URL (commented, '#' header). Use for FortiGate, Palo Alto EDL,
+      Check Point, and Juniper SRX.
     Value: !If
       - UseCloudFront
       - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv4.txt'
       - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv4.txt'
   FeedUrlIPv6:
-    Description: URL to configure as the FortiGate IPv6 external threat feed.
+    Description: >-
+      IPv6 feed URL (commented, '#' header). Use for FortiGate, Palo Alto EDL,
+      Check Point, and Juniper SRX.
     Value: !If
       - UseCloudFront
       - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv6.txt'
       - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv6.txt'
+  FeedUrlIPv4Cisco:
+    Description: >-
+      IPv4 feed URL (plain, no comment lines). Use for Cisco Secure Firewall
+      Security Intelligence feeds.
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv4_cisco.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv4_cisco.txt'
+  FeedUrlIPv6Cisco:
+    Description: >-
+      IPv6 feed URL (plain, no comment lines). Use for Cisco Secure Firewall
+      Security Intelligence feeds.
+    Value: !If
+      - UseCloudFront
+      - !Sub 'https://${Distribution.DomainName}/zscaler/svpn_ipv6_cisco.txt'
+      - !Sub 'https://${FeedBucket.RegionalDomainName}/zscaler/svpn_ipv6_cisco.txt'
